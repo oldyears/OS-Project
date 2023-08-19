@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -15,7 +17,6 @@ extern char etext[]; // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
-int refNum[(PHYSTOP - KERNBASE) / PGSIZE];
 /*
  * create a direct-map page table for the kernel.
  */
@@ -161,8 +162,6 @@ int mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
     if (*pte & PTE_V)
       panic("remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
-    if (pa >= KERNBASE)
-      refNum[(pa - KERNBASE) / PGSIZE] += 1;
     if (a == last)
       break;
     a += PGSIZE;
@@ -190,13 +189,10 @@ void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not mapped");
     if (PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    uint64 pa = PTE2PA(*pte);
-    if (pa >= KERNBASE)
-      refNum[(pa - KERNBASE) / PGSIZE] -= 1;
     if (do_free)
     {
-      if (refNum[((uint64)pa - KERNBASE) / PGSIZE] == 1)
-        kfree((void *)pa);
+      uint64 pa = PTE2PA(*pte);
+      kfree((void *)pa);
     }
     *pte = 0;
   }
@@ -331,11 +327,18 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if ((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
-    *pte = *pte & ~PTE_W;
-    *pte = *pte | PTE_COW;
     flags = PTE_FLAGS(*pte);
-    if (mappages(new, i, PGSIZE, pa, flags) != 0)
+    if (*pte & PTE_W)
+    {
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
+    flags = PTE_FLAGS(*pte);
+
+    if (mappages(new, i, PGSIZE, (uint64)pa, flags) != 0)
+    {
       goto err;
+    }
+    krefpage((void *)pa);
   }
   return 0;
 
@@ -365,39 +368,12 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while (len > 0)
   {
+    if (uvmcheckcowpage(dstva))
+      uvmcowcopy(dstva);
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
     if (pa0 == 0)
       return -1;
-    pte_t *pte;
-    if ((pte = walk(pagetable, va0, 0)) == 0)
-      return -1;
-    if (*pte & PTE_COW)
-    {
-      char *mem;
-      uint flags;
-      if (refNum[(pa0 - KERNBASE) / PGSIZE] == 2)
-      {
-        *pte = *pte | PTE_W;
-        *pte = *pte & ~PTE_COW;
-      }
-      else
-      {
-        if ((mem = kalloc()) == 0)
-          return -1;
-        else
-        {
-          refNum[(pa0 - KERNBASE) / PGSIZE] -= 1;
-          memmove(mem, (char *)pa0, PGSIZE);
-          *pte = *pte | PTE_W;
-          *pte = *pte & ~PTE_COW;
-          flags = PTE_FLAGS(*pte);
-          *pte = PA2PTE((uint64)mem) | flags;
-          refNum[((uint64)mem - KERNBASE) / PGSIZE] += 1;
-          pa0 = (uint64)mem;
-        }
-      }
-    }
     n = PGSIZE - (dstva - va0);
     if (n > len)
       n = len;
@@ -435,10 +411,6 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   return 0;
 }
 
-// Copy a null-terminated string from user to kernel.
-// Copy bytes to dst from virtual address srcva in a given page table,
-// until a '\0', or max.
-// Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
   uint64 n, va0, pa0;
@@ -483,4 +455,34 @@ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   {
     return -1;
   }
+}
+
+int uvmcheckcowpage(uint64 va)
+{
+  pte_t *pte;
+  struct proc *p = myproc();
+
+  return va < p->sz && ((pte = walk(p->pagetable, va, 0)) != 0) && (*pte & PTE_V) && (*pte & PTE_COW);
+}
+
+int uvmcowcopy(uint64 va)
+{
+  pte_t *pte;
+  struct proc *p = myproc();
+
+  if ((pte = walk(p->pagetable, va, 0)) == 0)
+    panic("uvmcowcopy: walk");
+
+  uint64 pa = PTE2PA(*pte);
+  uint64 new = (uint64)kcopy_n_deref((void *)pa); // 将一个懒复制的页引用变为一个实复制的页
+  if (new == 0)
+    return -1;
+
+  uint64 flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+  uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 0);
+  if (mappages(p->pagetable, va, 1, new, flags) == -1)
+  {
+    panic("uvmcowcopy: mappages");
+  }
+  return 0;
 }
